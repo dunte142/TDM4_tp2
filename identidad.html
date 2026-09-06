@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Identidad (Como Afirmacion de Si)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useRef } = React;
+
+
+const BG = '#000000';
+const CANVAS_W = 1280;
+const CANVAS_H = 720;
+const CENTER_X = CANVAS_W / 2;
+const CENTER_Y = CANVAS_H / 2;
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+
+const ORIGINAL_COLOR = '#FF7A1A'; 
+const BASE_CENTER_RADIUS = 80;
+const CATCH_RADIUS = 70;      
+const ASSIMILATION_TIME = 1000; 
+const EXPLOSION_DUR = 600;    
+const MARGIN = 50;
+
+
+const SHAPE_COLORS = ['#FF3B30', '#34C759', '#FFCC00', '#007AFF', '#AF52DE', '#FF2D55'];
+const SHAPE_TYPES = ['cuadrado', 'triangulo'];
+
+let idCounter = 1;
+
+
+function spawnShape(index, total) {
+
+  const angle = (index / total) * Math.PI * 2;
+  const dist = 300;
+  return {
+    id: idCounter++,
+    forma: SHAPE_TYPES[Math.floor(Math.random() * SHAPE_TYPES.length)],
+    color: SHAPE_COLORS[index % SHAPE_COLORS.length],
+    x: CENTER_X + Math.cos(angle) * dist,
+    y: CENTER_Y + Math.sin(angle) * dist,
+    vx: 0,
+    vy: 0,
+    size: 45,
+    held: false
+  };
+}
+
+function drawShape(ctx, s) {
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.fillStyle = s.color;
+  ctx.beginPath();
+  
+  if (s.forma === 'cuadrado') {
+    ctx.rect(-s.size / 2, -s.size / 2, s.size, s.size);
+  } else {
+    // Triangulo
+    ctx.moveTo(-s.size / 2, s.size / 2);
+    ctx.lineTo(s.size / 2, 0);
+    ctx.lineTo(-s.size / 2, -s.size / 2);
+    ctx.closePath();
+  }
+  
+  ctx.fill();
+  if (s.held) {
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const landmarkerRef = useRef(null);
+  const cursorRef = useRef({ x: CENTER_X, y: CENTER_Y, visible: false });
+  const heldIdRef = useRef(null);
+  const hubChargeRef = useRef(0);
+  const rafRef = useRef(null);
+
+  const shapesRef = useRef(Array.from({ length: 6 }, (_, i) => spawnShape(i, 6)));
+  
+ 
+  const identityRef = useRef({
+    mode: 'NORMAL', 
+    color: ORIGINAL_COLOR,
+    targetTime: 0, 
+    explosionStart: 0
+  });
+
+  const [status, setStatus] = useState('Iniciando camara...');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let stream;
+    let cancelled = false;
+
+    async function setup() {
+      try {
+        setStatus('Cargando modelo de tracking...');
+        const { HandLandmarker, FilesetResolver } = await import(TASKS_VISION_URL);
+        const vision = await FilesetResolver.forVisionTasks(`${TASKS_VISION_URL}/wasm`);
+
+        let landmarker;
+        try {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        } catch (gpuErr) {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        }
+        if (cancelled) return;
+        landmarkerRef.current = landmarker;
+
+        setStatus('Pidiendo acceso a la camara...');
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }, audio: false,
+        });
+        if (cancelled) return;
+        videoRef.current.srcObject = stream;
+        await new Promise((res) => { videoRef.current.onloadedmetadata = res; });
+        await videoRef.current.play();
+        setStatus('Listo');
+        setReady(true);
+      } catch (err) {
+        setStatus('Error: ' + err.message);
+      }
+    }
+    setup();
+    return () => {
+      cancelled = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    const ctx = canvasRef.current.getContext('2d');
+    let lastVideoTime = -1;
+
+    function loop() {
+      const now = performance.now();
+      const video = videoRef.current;
+      const landmarker = landmarkerRef.current;
+      const cursor = cursorRef.current;
+      const shapes = shapesRef.current;
+      const iden = identityRef.current;
+
+    
+      if (video.readyState >= 2 && landmarker) {
+        if (video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const result = landmarker.detectForVideo(video, now);
+          if (result.landmarks && result.landmarks.length > 0) {
+          
+            const tipX = (result.landmarks[0][8].x + result.landmarks[0][4].x) / 2;
+            const tipY = (result.landmarks[0][8].y + result.landmarks[0][4].y) / 2;
+            
+            const targetX = (1 - tipX) * CANVAS_W; 
+            const targetY = tipY * CANVAS_H;
+            
+            cursor.x += (targetX - cursor.x) * 0.35; 
+            cursor.y += (targetY - cursor.y) * 0.35;
+            cursor.visible = true;
+          } else {
+            cursor.visible = false;
+          }
+        }
+      }
+
+    
+      let centerRadius = BASE_CENTER_RADIUS;
+
+      if (iden.mode === 'NORMAL' || iden.mode === 'ASSIMILATED') {
+
+        const breatheSpeed = iden.mode === 'NORMAL' ? 0.003 : 0.008;
+        centerRadius = BASE_CENTER_RADIUS + Math.sin(now * breatheSpeed) * 12;
+
+        if (iden.mode === 'ASSIMILATED' && now >= iden.targetTime) {
+          iden.mode = 'EXPLODING';
+          iden.explosionStart = now;
+        }
+      } else if (iden.mode === 'EXPLODING') {
+   
+        const progress = (now - iden.explosionStart) / EXPLOSION_DUR;
+        
+        if (progress < 0.3) {
+       
+          const scale = progress / 0.3;
+          centerRadius = BASE_CENTER_RADIUS + (scale * 220);
+          
+        
+          shapes.forEach(s => {
+            const dx = s.x - CENTER_X;
+            const dy = s.y - CENTER_Y;
+            const dist = Math.hypot(dx, dy);
+            
+            if (dist < 400) {
+            
+              const force = (400 - dist) * 0.08; 
+              s.vx += (dx / dist) * force;
+              s.vy += (dy / dist) * force;
+              if (s.held) {
+                s.held = false;
+                heldIdRef.current = null;
+              }
+            }
+          });
+
+        } else {
+         
+          iden.color = ORIGINAL_COLOR;
+          const shrinkProgress = (progress - 0.3) / 0.7;
+          centerRadius = 300 - (shrinkProgress * (300 - BASE_CENTER_RADIUS));
+        }
+
+        if (progress >= 1) {
+          iden.mode = 'NORMAL';
+        }
+      }
+
+  
+      
+      if (heldIdRef.current === null && cursor.visible) {
+        let best = null, bestD = Infinity;
+        for (const s of shapes) {
+          const d = Math.hypot(cursor.x - s.x, cursor.y - s.y);
+          if (d < bestD) { bestD = d; best = s; }
+        }
+        if (best && bestD < CATCH_RADIUS) {
+          best.held = true;
+          heldIdRef.current = best.id;
+        }
+      } 
+   
+      else if (heldIdRef.current !== null) {
+        const s = shapes.find(sh => sh.id === heldIdRef.current);
+        if (s) {
+          if (!cursor.visible) {
+            s.held = false;
+            heldIdRef.current = null;
+          } else {
+          
+            s.x += (cursor.x - s.x) * 0.4;
+            s.y += (cursor.y - s.y) * 0.4;
+
+          
+            const distToCenter = Math.hypot(s.x - CENTER_X, s.y - CENTER_Y);
+            if (distToCenter < centerRadius + (s.size/2) && iden.mode === 'NORMAL') {
+              iden.mode = 'ASSIMILATED';
+              iden.color = s.color;
+              iden.targetTime = now + ASSIMILATION_TIME; 
+              
+              
+              s.held = false;
+              heldIdRef.current = null;
+              s.vx = (s.x - CENTER_X) * 0.15;
+              s.vy = (s.y - CENTER_Y) * 0.15;
+            }
+          }
+        } else {
+          heldIdRef.current = null;
+        }
+      }
+
+     
+      for (const s of shapes) {
+        if (!s.held) {
+          s.x += s.vx;
+          s.y += s.vy;
+          s.vx *= 0.92; 
+          s.vy *= 0.92;
+          
+        
+          if (s.x < MARGIN) { s.x = MARGIN; s.vx *= -1; }
+          if (s.x > CANVAS_W - MARGIN) { s.x = CANVAS_W - MARGIN; s.vx *= -1; }
+          if (s.y < MARGIN) { s.y = MARGIN; s.vy *= -1; }
+          if (s.y > CANVAS_H - MARGIN) { s.y = CANVAS_H - MARGIN; s.vy *= -1; }
+        }
+      }
+
+    
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    
+      for (const s of shapes) {
+        drawShape(ctx, s);
+      }
+
+    
+      ctx.beginPath();
+      ctx.arc(CENTER_X, CENTER_Y, Math.max(1, centerRadius), 0, Math.PI * 2);
+      ctx.fillStyle = iden.color;
+      ctx.fill();
+
+    
+      if (iden.mode === 'ASSIMILATED') {
+        const timeLeft = Math.max(0, iden.targetTime - now);
+        if (timeLeft < 1000) {
+          ctx.strokeStyle = `rgba(255, 255, 255, ${Math.sin(now * 0.05) * 0.5 + 0.5})`;
+          ctx.lineWidth = 4;
+          ctx.stroke();
+        }
+      }
+
+    
+      if (cursor.visible) {
+        ctx.beginPath();
+        ctx.arc(cursor.x, cursor.y, 8, 0, Math.PI * 2);
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+
+      const btnX = 40, btnY = 30, btnW = 150, btnH = 45;
+      const hoveringBack = cursor.visible && 
+                           cursor.x >= btnX && cursor.x <= (btnX + btnW) && 
+                           cursor.y >= btnY && cursor.y <= (btnY + btnH);
+
+      if (hoveringBack) {
+        hubChargeRef.current += 0.025;
+        if (hubChargeRef.current >= 1) {
+          window.location.href = 'index.html';
+        }
+      } else {
+        hubChargeRef.current = Math.max(0, hubChargeRef.current - 0.05);
+      }
+
+      ctx.fillStyle = hoveringBack ? 'rgba(255, 122, 26, 0.15)' : 'rgba(255, 255, 255, 0.04)';
+      ctx.strokeStyle = hoveringBack ? 'rgb(255, 122, 26)' : 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(btnX, btnY, btnW, btnH, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      if (hubChargeRef.current > 0) {
+        ctx.fillStyle = 'rgb(255, 122, 26)';
+        ctx.fillRect(btnX, btnY + btnH - 4, btnW * hubChargeRef.current, 4);
+      }
+
+      ctx.textAlign = 'center';
+      ctx.font = '600 13px system-ui, sans-serif';
+      ctx.letterSpacing = '2px';
+      ctx.fillStyle = hoveringBack ? 'rgb(255, 122, 26)' : '#FFFFFF';
+      ctx.fillText('← VOLVER', btnX + (btnW / 2), btnY + 28);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '700 18px system-ui, sans-serif';
+      ctx.letterSpacing = '3px';
+      ctx.fillText('IDENTIDAD', CANVAS_W - 40, 50);
+      
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.font = '400 13px system-ui, sans-serif';
+      ctx.letterSpacing = '1px';
+      ctx.fillText('(Como afirmación de sí)', CANVAS_W - 40, 72);
+     
+
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [ready]);
+
+  return (
+    <div style={{
+      background: BG, minHeight: '100vh', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', padding: 16,
+    }}>
+      <div style={{ position: 'relative', width: '100%', maxWidth: 900 }}>
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_W}
+          height={CANVAS_H}
+          style={{ width: '100%', display: 'block', background: BG, borderRadius: 8, boxShadow: '0 0 20px rgba(0,0,0,0.5)' }}
+        />
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
+        {status.startsWith('Error') && (
+          <p style={{
+            position: 'absolute', bottom: 8, left: 8, margin: 0, color: '#ff6b6b',
+            fontSize: 12, fontFamily: 'system-ui, sans-serif',
+            background: 'rgba(0,0,0,0.65)', padding: '4px 8px', borderRadius: 4,
+          }}>{status}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

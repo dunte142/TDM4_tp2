@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Expectativa (La Convergencia)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #050505; overflow: hidden; font-family: system-ui, sans-serif; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useRef } = React;
+
+
+const BG = '#050505';
+const CANVAS_W = 1280;
+const CANVAS_H = 720;
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+
+const SMALL_SHAPES_COUNT = 100;  
+const CHARGE_TIME = 200;         
+const MOVEMENT_PENALTY = 8;      
+const SMOOTH_FACTOR = 0.3;
+
+const SHAPE_TYPES = ['cuadrado', 'circulo', 'triangulo'];
+const COLORS = [
+  '255, 122, 26',  
+  '52, 199, 89',   
+  '0, 122, 255',   
+  '175, 82, 222',  
+  '255, 204, 0'   
+];
+
+function generateSmallShapes(count) {
+  return Array.from({ length: count }, () => ({
+    x: Math.random() * CANVAS_W,
+    y: Math.random() * CANVAS_H,
+    vx: (Math.random() - 0.5) * 2,
+    vy: (Math.random() - 0.5) * 2,
+    size: 8 + Math.random() * 8, 
+    type: SHAPE_TYPES[Math.floor(Math.random() * SHAPE_TYPES.length)],
+    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    rot: Math.random() * Math.PI * 2,
+    rotSpeed: (Math.random() - 0.5) * 0.1
+  }));
+}
+
+function drawGeometry(ctx, type, size) {
+  ctx.beginPath();
+  if (type === 'cuadrado') {
+    ctx.rect(-size/2, -size/2, size, size);
+  } else if (type === 'circulo') {
+    ctx.arc(0, 0, size/2, 0, Math.PI*2);
+  } else if (type === 'triangulo') {
+    ctx.moveTo(0, -size/2); 
+    ctx.lineTo(size/2, size/2); 
+    ctx.lineTo(-size/2, size/2); 
+    ctx.closePath();
+  }
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const landmarkerRef = useRef(null);
+  
+  const smallShapesRef = useRef(generateSmallShapes(SMALL_SHAPES_COUNT));
+  const completedShapesRef = useRef([]); 
+  const shockwavesRef = useRef([]);
+  
+  const stateRef = useRef({
+    progress: 0, 
+  });
+
+  const cursorRef = useRef({ x: CANVAS_W / 2, y: CANVAS_H / 2, visible: false, prevX: CANVAS_W / 2, prevY: CANVAS_H / 2 });
+  const hubChargeRef = useRef(0); // Referencia para el botón volver
+  const rafRef = useRef(null);
+
+  const [status, setStatus] = useState('Iniciando camara...');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let stream;
+    let cancelled = false;
+
+    async function setup() {
+      try {
+        setStatus('Cargando modelo de tracking...');
+        const { HandLandmarker, FilesetResolver } = await import(TASKS_VISION_URL);
+        const vision = await FilesetResolver.forVisionTasks(`${TASKS_VISION_URL}/wasm`);
+
+        let landmarker;
+        try {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        } catch (gpuErr) {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        }
+        if (cancelled) return;
+        landmarkerRef.current = landmarker;
+
+        setStatus('Pidiendo acceso a la camara...');
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }, audio: false,
+        });
+        if (cancelled) return;
+        videoRef.current.srcObject = stream;
+        await new Promise((res) => { videoRef.current.onloadedmetadata = res; });
+        await videoRef.current.play();
+        setStatus('Listo -- Mantené tu mano quieta para converger las figuras');
+        setReady(true);
+      } catch (err) {
+        setStatus('Error: ' + err.message);
+      }
+    }
+    setup();
+    return () => {
+      cancelled = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    const ctx = canvasRef.current.getContext('2d');
+    let lastVideoTime = -1;
+
+    function loop() {
+      const now = performance.now();
+      const video = videoRef.current;
+      const landmarker = landmarkerRef.current;
+      const cursor = cursorRef.current;
+      const sys = stateRef.current;
+      const smallShapes = smallShapesRef.current;
+      const completedShapes = completedShapesRef.current;
+      const shockwaves = shockwavesRef.current;
+
+     
+      cursor.prevX = cursor.x;
+      cursor.prevY = cursor.y;
+
+      if (video.readyState >= 2 && landmarker) {
+        if (video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const result = landmarker.detectForVideo(video, now);
+          if (result.landmarks && result.landmarks.length > 0) {
+            const tip = result.landmarks[0][8]; 
+            const targetX = (1 - tip.x) * CANVAS_W;
+            const targetY = tip.y * CANVAS_H;
+            cursor.x += (targetX - cursor.x) * SMOOTH_FACTOR;
+            cursor.y += (targetY - cursor.y) * SMOOTH_FACTOR;
+            cursor.visible = true;
+          } else {
+            cursor.visible = false;
+          }
+        }
+      }
+
+      const handSpeed = Math.hypot(cursor.x - cursor.prevX, cursor.y - cursor.prevY);
+
+      if (cursor.visible) {
+        if (handSpeed < MOVEMENT_PENALTY) {
+          sys.progress += 1;
+        } else {
+          sys.progress *= 0.7; 
+        }
+
+        if (sys.progress >= CHARGE_TIME) {
+          sys.progress = 0; 
+          
+          shockwaves.push({ x: cursor.x, y: cursor.y, radius: 10, alpha: 1 });
+          
+          completedShapes.push({
+            x: cursor.x, y: cursor.y,
+            type: SHAPE_TYPES[Math.floor(Math.random() * SHAPE_TYPES.length)],
+            color: COLORS[Math.floor(Math.random() * COLORS.length)],
+            size: 80 + Math.random() * 60,
+            rot: Math.random() * Math.PI,
+            alpha: 1
+          });
+
+          for (const s of smallShapes) {
+            const dx = s.x - cursor.x;
+            const dy = s.y - cursor.y;
+            const dist = Math.hypot(dx, dy) || 1;
+            s.vx += (dx / dist) * 25;
+            s.vy += (dy / dist) * 25;
+          }
+        }
+      } else {
+        sys.progress *= 0.8; 
+      }
+
+      const progressRatio = Math.min(1, sys.progress / CHARGE_TIME);
+
+     
+      for (const s of smallShapes) {
+        if (cursor.visible && progressRatio > 0.02) {
+          const dx = cursor.x - s.x;
+          const dy = cursor.y - s.y;
+          const dist = Math.hypot(dx, dy) || 1;
+          
+          const pullForce = (progressRatio * 1.5) / (dist * 0.01 + 1);
+          s.vx += dx * pullForce * 0.01;
+          s.vy += dy * pullForce * 0.01;
+
+          const tangentForce = progressRatio * 1.2;
+          s.vx += (dy / dist) * tangentForce; 
+          s.vy -= (dx / dist) * tangentForce; 
+          
+          s.rotSpeed = (Math.random() - 0.5) * 0.1 + (progressRatio * 0.2);
+        } else {
+          s.vx += (Math.random() - 0.5) * 0.4;
+          s.vy += (Math.random() - 0.5) * 0.4;
+          s.rotSpeed *= 0.95; 
+        }
+
+        s.vx *= 0.95;
+        s.vy *= 0.95;
+
+        s.x += s.vx;
+        s.y += s.vy;
+        s.rot += s.rotSpeed;
+
+        if (s.x < -20) s.x = CANVAS_W + 20; 
+        if (s.x > CANVAS_W + 20) s.x = -20;
+        if (s.y < -20) s.y = CANVAS_H + 20; 
+        if (s.y > CANVAS_H + 20) s.y = -20;
+      }
+
+   
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      for (let i = completedShapes.length - 1; i >= 0; i--) {
+        const s = completedShapes[i];
+        s.y -= 0.3; 
+        s.rot += 0.005; 
+        s.alpha -= 0.002; 
+        
+        ctx.save();
+        ctx.translate(s.x, s.y);
+        ctx.rotate(s.rot);
+        ctx.fillStyle = `rgba(${s.color}, ${s.alpha})`;
+        ctx.shadowBlur = 30 * s.alpha;
+        ctx.shadowColor = `rgba(${s.color}, ${s.alpha})`;
+        drawGeometry(ctx, s.type, s.size);
+        ctx.fill();
+        ctx.restore();
+        
+        if (s.alpha <= 0) completedShapes.splice(i, 1);
+      }
+
+      for (const s of smallShapes) {
+        ctx.save();
+        ctx.translate(s.x, s.y);
+        ctx.rotate(s.rot);
+        
+        const glow = progressRatio * 0.8;
+        ctx.fillStyle = `rgba(${s.color}, ${0.4 + glow})`;
+        
+        drawGeometry(ctx, s.type, s.size);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      for (let i = shockwaves.length - 1; i >= 0; i--) {
+        const sw = shockwaves[i];
+        ctx.beginPath();
+        ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255, 255, 255, ${sw.alpha})`;
+        ctx.lineWidth = 4 * sw.alpha;
+        ctx.stroke();
+        
+        sw.radius += 20;
+        sw.alpha -= 0.05;
+        if (sw.alpha <= 0) shockwaves.splice(i, 1);
+      }
+
+      if (cursor.visible) {
+        ctx.beginPath();
+        ctx.arc(cursor.x, cursor.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.fill();
+      }
+
+      const btnX = 40, btnY = 30, btnW = 150, btnH = 45;
+      const hoveringBack = cursor.visible && 
+                           cursor.x >= btnX && cursor.x <= (btnX + btnW) && 
+                           cursor.y >= btnY && cursor.y <= (btnY + btnH);
+
+      if (hoveringBack) {
+        hubChargeRef.current += 0.025;
+        if (hubChargeRef.current >= 1) {
+          window.location.href = 'index.html';
+        }
+      } else {
+        hubChargeRef.current = Math.max(0, hubChargeRef.current - 0.05);
+      }
+
+      // Fondo del botón
+      ctx.fillStyle = hoveringBack ? 'rgba(255, 122, 26, 0.15)' : 'rgba(255, 255, 255, 0.04)';
+      ctx.strokeStyle = hoveringBack ? 'rgb(255, 122, 26)' : 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(btnX, btnY, btnW, btnH, 6);
+      ctx.fill();
+      ctx.stroke();
+
+    
+      if (hubChargeRef.current > 0) {
+        ctx.fillStyle = 'rgb(255, 122, 26)';
+        ctx.fillRect(btnX, btnY + btnH - 4, btnW * hubChargeRef.current, 4);
+      }
+
+    
+      ctx.textAlign = 'center';
+      ctx.font = '600 13px system-ui, sans-serif';
+      ctx.letterSpacing = '2px';
+      ctx.fillStyle = hoveringBack ? 'rgb(255, 122, 26)' : '#FFFFFF';
+      ctx.fillText('← VOLVER', btnX + (btnW / 2), btnY + 28);
+
+     
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '700 18px system-ui, sans-serif';
+      ctx.letterSpacing = '3px';
+      ctx.fillText('EXPECTATIVA', CANVAS_W - 40, 50);
+      
+  
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.font = '400 13px system-ui, sans-serif';
+      ctx.letterSpacing = '1px';
+      ctx.fillText('(La convergencia)', CANVAS_W - 40, 72);
+    
+
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [ready]);
+
+  return (
+    <div style={{ background: BG, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+      <div style={{ position: 'relative', width: '100%', maxWidth: 900 }}>
+        <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H} style={{ width: '100%', display: 'block', background: BG, borderRadius: 8, boxShadow: '0 0 20px rgba(0,0,0,0.5)' }} />
+        <video ref={videoRef} muted playsInline style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }} />
+        {status.startsWith('Error') && (
+          <p style={{ position: 'absolute', bottom: 8, left: 8, margin: 0, color: '#ff6b6b', fontSize: 12, background: 'rgba(0,0,0,0.65)', padding: '4px 8px', borderRadius: 4 }}>{status}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

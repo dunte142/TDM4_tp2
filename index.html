@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hub de Sistemas</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #050505; overflow: hidden; font-family: system-ui, sans-serif; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+  #status-overlay { position: absolute; bottom: 10px; left: 10px; color: #555; font-size: 12px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useRef } = React;
+
+
+const BG = '#050505';
+const CANVAS_W = 1280;
+const CANVAS_H = 720;
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+const SMOOTH_FACTOR = 0.35;
+const CHARGE_SPEED = 0.018; 
+
+
+const ORANGE = '255, 122, 26';
+const GREEN = '52, 199, 89';
+const BLUE = '0, 122, 255';
+const VIOLET = '175, 82, 222';
+const PINK = '255, 45, 85';
+
+
+const SYSTEMS = [
+
+  { id: 'memoria', title: 'MEMORIA', url: 'memoria.html', col: 0, row: 0 },
+  { id: 'herencia', title: 'HERENCIA', url: 'herencia.html', col: 1, row: 0 },
+  { id: 'caducidad', title: 'CADUCIDAD', url: 'caducidad.html', col: 2, row: 0 },
+  
+ 
+  { id: 'identidad', title: 'IDENTIDAD', url: 'identidad.html', col: 0, row: 1 },
+  { id: 'empatia', title: 'EMPATÍA', url: 'empatia.html', col: 1, row: 1 },
+  { id: 'colaboracion', title: 'COLABORACIÓN', url: 'colaboracion.html', col: 2, row: 1 },
+  
+ 
+  { id: 'incertidumbre', title: 'INCERTIDUMBRE', url: 'incertidumbre.html', col: 0, row: 2 },
+  { id: 'ansiedad', title: 'ANSIEDAD', url: 'ansiedad.html', col: 1, row: 2 },
+  { id: 'expectativa', title: 'EXPECTATIVA', url: 'expectativa.html', col: 2, row: 2 }
+];
+
+
+const BOX_SIZE = 160;
+const SPACING_X = 180; 
+const SPACING_Y = 80; 
+const OFFSET_X = (CANVAS_W - (BOX_SIZE * 3 + SPACING_X * 2)) / 2;
+const OFFSET_Y = (CANVAS_H - (BOX_SIZE * 3 + SPACING_Y * 2)) / 2 + 15; 
+
+SYSTEMS.forEach(sys => {
+  sys.cx = OFFSET_X + (BOX_SIZE / 2) + sys.col * (BOX_SIZE + SPACING_X);
+  sys.cy = OFFSET_Y + (BOX_SIZE / 2) + sys.row * (BOX_SIZE + SPACING_Y);
+  sys.charge = 0;
+});
+
+
+function drawThumbnail(ctx, id, now) {
+  const t = now;
+  
+  switch(id) {
+    case 'memoria': {
+      const rx = Math.sin(t * 0.002) * 35;
+      const ry = Math.cos(t * 0.003) * 25;
+      for(let i=0; i<12; i++) {
+        const x = ((i*37)%120) - 60;
+        const y = ((i*53)%120) - 60;
+        const dist = Math.hypot(x - rx, y - ry);
+        const alpha = dist < 45 ? Math.max(0.2, 1 - dist/45) : 0.1;
+        ctx.fillStyle = i % 3 === 0 ? `rgba(${ORANGE}, ${alpha})` : `rgba(180, 180, 180, ${alpha})`;
+        ctx.fillRect(x - 3, y - 3, 6, 6);
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(rx, ry, 15, 0, Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(rx, ry, 10, 0, Math.PI*2); ctx.stroke();
+      break;
+    }
+
+    case 'herencia': {
+      const cycle = t % 3000;
+      const s1 = { x: -35, y: -10, color: `rgb(${BLUE})`, active: cycle > 600 && cycle < 2000 };
+      const s2 = { x: 35, y: 10, color: `rgb(${VIOLET})`, active: cycle > 1200 && cycle < 2000 };
+      [s1, s2].forEach(s => {
+        ctx.fillStyle = s.color;
+        ctx.fillRect(s.x - 12, s.y - 12, 24, 24);
+        if (s.active) {
+          ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 3;
+          ctx.strokeRect(s.x - 12, s.y - 12, 24, 24);
+        }
+      });
+      if (cycle >= 2000) {
+        ctx.fillStyle = `rgb(${BLUE})`;
+        ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI*2); ctx.fill();
+      }
+      break;
+    }
+
+    case 'caducidad': {
+      const cycle = (t % 2500) / 2500;
+      const px = -40 + cycle * 80;
+      const py = Math.sin(cycle * Math.PI * 2) * 25;
+      const size = Math.max(2, 18 * (1 - cycle));
+      const alpha = 1 - cycle;
+      for(let i=0; i<6; i++) {
+        const pastC = Math.max(0, cycle - i*0.05);
+        const tx = -40 + pastC * 80;
+        const ty = Math.sin(pastC * Math.PI * 2) * 25;
+        ctx.fillStyle = `rgba(${GREEN}, ${(1 - pastC)*0.4})`;
+        ctx.beginPath(); ctx.arc(tx, ty, 3, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle = `rgba(${GREEN}, ${alpha})`;
+      ctx.beginPath(); ctx.arc(px, py, size/2, 0, Math.PI*2); ctx.fill();
+      break;
+    }
+
+    case 'identidad': {
+      const cycle = t % 3500;
+      let r = 18;
+      let col = ORANGE;
+      if (cycle < 1500) {
+        r += Math.sin(t * 0.005) * 3;
+      } else if (cycle < 2800) {
+        col = BLUE;
+        r += Math.sin(t * 0.012) * 4;
+      } else {
+        const p = (cycle - 2800) / 700;
+        r = 20 + p * 50;
+        col = ORANGE;
+      }
+      const satDist = cycle > 2800 ? 60 + ((cycle-2800)/700)*30 : 45;
+      ctx.fillStyle = `rgb(${BLUE})`;
+      ctx.fillRect(-satDist - 8, -8, 16, 16);
+      ctx.fillStyle = `rgb(${col})`;
+      ctx.beginPath(); ctx.arc(0, 0, Math.max(1, r), 0, Math.PI*2); ctx.fill();
+      break;
+    }
+
+    case 'empatia': {
+      const angle = t * 0.002;
+      const handX = Math.cos(angle) * 20;
+      const handY = Math.sin(angle) * 20;
+      const shapeX = Math.cos(angle + 1.2) * 45;
+      const shapeY = Math.sin(angle + 1.2) * 45;
+      ctx.strokeStyle = `rgba(${VIOLET}, 0.6)`; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(handX, handY); ctx.lineTo(shapeX, shapeY); ctx.stroke();
+      ctx.fillStyle = `rgb(${VIOLET})`;
+      ctx.fillRect(shapeX - 8, shapeY - 8, 16, 16);
+      ctx.fillStyle = `rgb(${VIOLET})`;
+      ctx.beginPath(); ctx.arc(handX, handY, 10, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#FFF'; ctx.lineWidth = 1.5; ctx.stroke();
+      break;
+    }
+
+    case 'colaboracion': {
+      const cycle = t % 4000;
+      const stage = Math.floor(cycle / 1000);
+      const nodes = [{x:-45,y:-20}, {x:-15,y:20}, {x:15,y:-20}, {x:45,y:20}];
+      ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      nodes.forEach((n, idx) => { if(idx===0) ctx.moveTo(n.x, n.y); else ctx.lineTo(n.x, n.y); });
+      ctx.stroke();
+      nodes.forEach((n, idx) => {
+        const done = stage >= idx;
+        ctx.fillStyle = done ? `rgb(${ORANGE})` : 'rgba(255,122,26,0.2)';
+        ctx.beginPath(); ctx.arc(n.x, n.y, 8, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = done ? '#FFF' : 'rgba(255,122,26,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+      });
+      break;
+    }
+
+    case 'incertidumbre': {
+      const cycle = t % 2000;
+      const step = Math.floor(cycle / 500);
+      const shapes = ['cuadrado', 'circulo', 'triangulo', 'rombo'];
+      const colors = [PINK, GREEN, BLUE, ORANGE];
+      ctx.fillStyle = `rgb(${colors[step % 4]})`;
+      ctx.save();
+      ctx.rotate(step * 0.5);
+      const s = step === 1 ? 30 : step === 3 ? 12 : 20;
+      ctx.beginPath();
+      if(shapes[step%4] === 'cuadrado') ctx.rect(-s/2, -s/2, s, s);
+      else if(shapes[step%4] === 'circulo') ctx.arc(0, 0, s/2, 0, Math.PI*2);
+      else { ctx.moveTo(0, -s/2); ctx.lineTo(s/2, s/2); ctx.lineTo(-s/2, s/2); ctx.closePath(); }
+      ctx.fill();
+      ctx.restore();
+      if (cycle % 500 < 100) {
+        ctx.strokeStyle = '#FFF'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(0, 0, 25, 0, Math.PI*2); ctx.stroke();
+      }
+      break;
+    }
+
+    case 'ansiedad': {
+      const cycle = t % 3000;
+      const count = cycle < 1000 ? 3 : cycle < 2000 ? 7 : 15;
+      for(let i=0; i<count; i++) {
+        const rx = ((i*29)%80) - 40 + (Math.random()-0.5)*(count*0.4);
+        const ry = ((i*47)%80) - 40 + (Math.random()-0.5)*(count*0.4);
+        ctx.fillStyle = `rgb(${ORANGE})`;
+        ctx.fillRect(rx - 3, ry - 3, 6, 6);
+      }
+      break;
+    }
+
+    case 'expectativa': {
+      const cycle = (t % 3000) / 3000;
+      if (cycle < 0.85) {
+        const prog = cycle / 0.85;
+        for(let i=0; i<16; i++) {
+          const a = (i * Math.PI * 2 / 16) + (t * 0.003);
+          const dist = 55 * (1 - prog);
+          const x = Math.cos(a) * dist;
+          const y = Math.sin(a) * dist;
+          ctx.fillStyle = `rgb(${GREEN})`;
+          ctx.fillRect(x - 2, y - 2, 4, 4);
+        }
+      } else {
+        ctx.fillStyle = `rgb(${GREEN})`;
+        ctx.shadowBlur = 15; ctx.shadowColor = `rgb(${GREEN})`;
+        ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+      break;
+    }
+  }
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const landmarkerRef = useRef(null);
+  
+  const cursorRef = useRef({ x: CANVAS_W / 2, y: CANVAS_H / 2, visible: false });
+  const rafRef = useRef(null);
+  
+  const [status, setStatus] = useState('Iniciando entorno...');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let stream;
+    let cancelled = false;
+
+    async function setup() {
+      try {
+        const { HandLandmarker, FilesetResolver } = await import(TASKS_VISION_URL);
+        const vision = await FilesetResolver.forVisionTasks(`${TASKS_VISION_URL}/wasm`);
+
+        let landmarker;
+        try {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        } catch (gpuErr) {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        }
+        if (cancelled) return;
+        landmarkerRef.current = landmarker;
+
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }, audio: false,
+        });
+        if (cancelled) return;
+        videoRef.current.srcObject = stream;
+        await new Promise((res) => { videoRef.current.onloadedmetadata = res; });
+        await videoRef.current.play();
+        
+        setStatus('Cargado');
+        setReady(true);
+      } catch (err) {
+        setStatus('Error: ' + err.message);
+      }
+    }
+    setup();
+    return () => {
+      cancelled = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    const ctx = canvasRef.current.getContext('2d');
+    let lastVideoTime = -1;
+
+    function loop() {
+      const now = performance.now();
+      const video = videoRef.current;
+      const landmarker = landmarkerRef.current;
+      const cursor = cursorRef.current;
+
+      
+      if (video.readyState >= 2 && landmarker) {
+        if (video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const result = landmarker.detectForVideo(video, now);
+          if (result.landmarks && result.landmarks.length > 0) {
+            const tip = result.landmarks[0][8]; 
+            const targetX = (1 - tip.x) * CANVAS_W;
+            const targetY = tip.y * CANVAS_H;
+            cursor.x += (targetX - cursor.x) * SMOOTH_FACTOR;
+            cursor.y += (targetY - cursor.y) * SMOOTH_FACTOR;
+            cursor.visible = true;
+          } else {
+            cursor.visible = false;
+          }
+        }
+      }
+
+     
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+     
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.015)';
+      for (let y = 0; y < CANVAS_H; y += 4) ctx.fillRect(0, y, CANVAS_W, 1);
+
+      let hoveringAny = false;
+
+      SYSTEMS.forEach(sys => {
+    
+        const inBounds = cursor.visible && 
+                         Math.abs(cursor.x - sys.cx) < BOX_SIZE / 2 && 
+                         Math.abs(cursor.y - sys.cy) < BOX_SIZE / 2;
+
+        if (inBounds) {
+          sys.charge += CHARGE_SPEED;
+          hoveringAny = true;
+          if (sys.charge >= 1) {
+            sys.charge = 1;
+            window.location.href = sys.url; 
+          }
+        } else {
+          sys.charge = Math.max(0, sys.charge - 0.04);
+        }
+
+       
+        ctx.fillStyle = sys.charge > 0 ? `rgb(${ORANGE})` : '#CCCCCC';
+        ctx.font = '600 13px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.letterSpacing = '2px';
+        ctx.fillText(sys.title, sys.cx, sys.cy - BOX_SIZE/2 - 15);
+
+       
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(sys.cx - BOX_SIZE/2, sys.cy - BOX_SIZE/2, BOX_SIZE, BOX_SIZE);
+
+      
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sys.cx - BOX_SIZE/2, sys.cy - BOX_SIZE/2, BOX_SIZE, BOX_SIZE);
+
+        
+        ctx.save();
+        ctx.translate(sys.cx, sys.cy);
+        ctx.beginPath();
+        ctx.rect(-BOX_SIZE/2, -BOX_SIZE/2, BOX_SIZE, BOX_SIZE);
+        ctx.clip(); 
+        
+        drawThumbnail(ctx, sys.id, now);
+        ctx.restore();
+
+       
+        if (sys.charge > 0) {
+          ctx.strokeStyle = `rgb(${ORANGE})`;
+          ctx.lineWidth = 4;
+          
+          const perimeter = BOX_SIZE * 4;
+          const drawLen = perimeter * sys.charge;
+          
+          ctx.save();
+          ctx.translate(sys.cx - BOX_SIZE/2, sys.cy - BOX_SIZE/2);
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          
+          let l = drawLen;
+          if (l > 0) { const d = Math.min(l, BOX_SIZE); ctx.lineTo(d, 0); l -= d; }
+          if (l > 0) { const d = Math.min(l, BOX_SIZE); ctx.lineTo(BOX_SIZE, d); l -= d; }
+          if (l > 0) { const d = Math.min(l, BOX_SIZE); ctx.lineTo(BOX_SIZE - d, BOX_SIZE); l -= d; }
+          if (l > 0) { const d = Math.min(l, BOX_SIZE); ctx.lineTo(0, BOX_SIZE - d); l -= d; }
+          
+          ctx.shadowBlur = 12;
+          ctx.shadowColor = `rgb(${ORANGE})`;
+          ctx.stroke();
+          ctx.restore();
+
+        
+          if (sys.charge > 0.85) {
+            ctx.fillStyle = `rgba(255, 255, 255, ${(sys.charge - 0.85) * 3})`;
+            ctx.fillRect(sys.cx - BOX_SIZE/2, sys.cy - BOX_SIZE/2, BOX_SIZE, BOX_SIZE);
+          }
+        }
+      });
+
+     
+      if (cursor.visible) {
+        ctx.save();
+        ctx.translate(cursor.x, cursor.y);
+        
+        ctx.beginPath();
+        ctx.arc(0, 0, 5, 0, Math.PI * 2);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(0, 0, hoveringAny ? 22 : 14, 0, Math.PI * 2);
+        ctx.strokeStyle = hoveringAny ? `rgb(${ORANGE})` : 'rgba(255,255,255,0.4)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [ready]);
+
+  return (
+    <div style={{ background: BG, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+      <div style={{ position: 'relative', width: '100%', maxWidth: 1280 }}>
+        <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H} style={{ width: '100%', display: 'block', background: BG, borderRadius: 8, boxShadow: '0 0 20px rgba(0,0,0,0.5)' }} />
+        <video ref={videoRef} muted playsInline style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }} />
+        {status !== 'Cargado' && <div id="status-overlay">{status}</div>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

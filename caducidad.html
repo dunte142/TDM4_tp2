@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Caducidad (como lo perdido en el transito)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #050505; overflow: hidden; font-family: system-ui, sans-serif; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useRef } = React;
+
+const ACCENT = '#FF7A1A';
+const BG = '#050505';
+const CANVAS_W = 1280;
+const CANVAS_H = 720;
+const SHAPE_TYPES = ['cuadrado', 'circulo', 'triangulo'];
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+const N_SHAPES = 7;
+const CATCH_RADIUS = 90;
+const RELEASE_RADIUS = 150;
+const DECAY_DISTANCE = 900;
+const FOLLOW_LERP = 0.28;
+const STILL_SPEED = 1.0;
+const RELEASE_STILL_MS = 550;
+const RESPAWN_MIN_MS = 500;
+const RESPAWN_MAX_MS = 1600;
+const MARGIN = 70;
+const BASE_SIZE = 46;
+
+const TRAIL_SPACING = 9;      
+const TRAIL_FADE_MS = 2400;   
+
+function randomHSL() {
+  const hues = [280, 355, 40, 205, 190, 130, 320, 25, 260];
+  const h = hues[Math.floor(Math.random() * hues.length)];
+  const s = 55 + Math.random() * 25;
+  const l = 40 + Math.random() * 14;
+  return { h, s, l };
+}
+
+let idCounter = 1;
+function spawnShape() {
+  const x = MARGIN + Math.random() * (CANVAS_W - MARGIN * 2);
+  const y = MARGIN + Math.random() * (CANVAS_H - MARGIN * 2);
+  const hsl = randomHSL();
+  return {
+    id: idCounter++,
+    forma: SHAPE_TYPES[Math.floor(Math.random() * SHAPE_TYPES.length)],
+    hue: hsl.h, sat: hsl.s, light: hsl.l,
+    x, y,
+    odometer: 0,
+    held: false,
+    armed: true,
+    stillMs: 0,
+    lastTrailX: x,
+    lastTrailY: y,
+  };
+}
+
+function shapeVisual(s) {
+  const progress = Math.min(1, s.odometer / DECAY_DISTANCE);
+  return { alpha: 1 - progress, size: BASE_SIZE * (1 - progress) };
+}
+
+function drawShape(ctx, s) {
+  const { alpha, size } = shapeVisual(s);
+  if (size < 1.5 || alpha <= 0.015) return;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.fillStyle = `hsla(${s.hue}, ${s.sat}%, ${s.light}%, ${alpha})`;
+  ctx.beginPath();
+  if (s.forma === 'cuadrado') {
+    ctx.rect(-size / 2, -size / 2, size, size);
+  } else if (s.forma === 'circulo') {
+    ctx.arc(0, 0, size / 2, 0, Math.PI * 2);
+  } else {
+    ctx.moveTo(-size / 2, size / 2);
+    ctx.lineTo(size / 2, 0);
+    ctx.lineTo(-size / 2, -size / 2);
+    ctx.closePath();
+  }
+  ctx.fill();
+  if (s.held) {
+    ctx.strokeStyle = `rgba(255,255,255,${0.5 * alpha})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawTrailPoint(ctx, t, now) {
+  const age = now - t.bornAt;
+  const alpha = t.alpha0 * Math.max(0, 1 - age / TRAIL_FADE_MS);
+  if (alpha <= 0.015 || t.size < 1) return;
+  ctx.beginPath();
+  ctx.fillStyle = `hsla(${t.hue}, ${t.sat}%, ${t.light}%, ${alpha})`;
+  ctx.arc(t.x, t.y, t.size, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const landmarkerRef = useRef(null);
+  const shapesRef = useRef(Array.from({ length: N_SHAPES }, spawnShape));
+  const trailRef = useRef([]);
+  const pendingSpawnsRef = useRef([]);
+  const cursorRef = useRef({ x: CANVAS_W / 2, y: CANVAS_H / 2, visible: false, prevX: CANVAS_W / 2, prevY: CANVAS_H / 2 });
+  const heldIdRef = useRef(null);
+  const hubChargeRef = useRef(0);
+  const rafRef = useRef(null);
+
+  const [status, setStatus] = useState('Iniciando camara...');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let stream;
+    let cancelled = false;
+
+    async function setup() {
+      try {
+        setStatus('Cargando modelo de tracking...');
+        const { HandLandmarker, FilesetResolver } = await import(TASKS_VISION_URL);
+        const vision = await FilesetResolver.forVisionTasks(`${TASKS_VISION_URL}/wasm`);
+
+        let landmarker;
+        try {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        } catch (gpuErr) {
+          landmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numHands: 1,
+          });
+        }
+        if (cancelled) return;
+        landmarkerRef.current = landmarker;
+
+        setStatus('Pidiendo acceso a la camara...');
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }, audio: false,
+        });
+        if (cancelled) return;
+        videoRef.current.srcObject = stream;
+        await new Promise((res) => { videoRef.current.onloadedmetadata = res; });
+        await videoRef.current.play();
+        setStatus('Listo');
+        setReady(true);
+      } catch (err) {
+        console.error(err);
+        setStatus('Error: ' + err.message);
+      }
+    }
+    setup();
+    return () => {
+      cancelled = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    const ctx = canvasRef.current.getContext('2d');
+    let lastVideoTime = -1;
+
+    function dropTrailPoint(s, now) {
+      const { alpha, size } = shapeVisual(s);
+      trailRef.current.push({
+        x: s.x, y: s.y,
+        hue: s.hue, sat: s.sat, light: s.light,
+        size: Math.max(2, size * 0.4),
+        alpha0: alpha,
+        bornAt: now,
+      });
+      s.lastTrailX = s.x;
+      s.lastTrailY = s.y;
+    }
+
+    function loop() {
+      const now = performance.now();
+      const video = videoRef.current;
+      const landmarker = landmarkerRef.current;
+      const cursor = cursorRef.current;
+
+      cursor.prevX = cursor.x;
+      cursor.prevY = cursor.y;
+
+   
+      if (video.readyState >= 2 && landmarker) {
+        if (video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const result = landmarker.detectForVideo(video, now);
+          if (result.landmarks && result.landmarks.length > 0) {
+            const tip = result.landmarks[0][8];
+            const targetX = (1 - tip.x) * CANVAS_W;
+            const targetY = tip.y * CANVAS_H;
+            cursor.x += (targetX - cursor.x) * 0.35;
+            cursor.y += (targetY - cursor.y) * 0.35;
+            cursor.visible = true;
+          } else {
+            cursor.visible = false;
+          }
+        }
+      }
+
+      const cursorSpeed = Math.hypot(cursor.x - cursor.prevX, cursor.y - cursor.prevY);
+      const shapes = shapesRef.current;
+
+      for (const s of shapes) {
+        if (!s.armed) {
+          const d = cursor.visible ? Math.hypot(cursor.x - s.x, cursor.y - s.y) : Infinity;
+          if (d > RELEASE_RADIUS) s.armed = true;
+        }
+      }
+
+   
+      if (heldIdRef.current === null && cursor.visible) {
+        let best = null, bestD = Infinity;
+        for (const s of shapes) {
+          if (!s.armed) continue;
+          const d = Math.hypot(cursor.x - s.x, cursor.y - s.y);
+          if (d < bestD) { bestD = d; best = s; }
+        }
+        if (best && bestD < CATCH_RADIUS) {
+          best.held = true;
+          best.stillMs = 0;
+          best.lastTrailX = best.x;
+          best.lastTrailY = best.y;
+          heldIdRef.current = best.id;
+        }
+      } else if (heldIdRef.current !== null) {
+        const s = shapes.find((sh) => sh.id === heldIdRef.current);
+        if (s) {
+          if (!cursor.visible) {
+            dropTrailPoint(s, now);
+            s.held = false;
+            s.armed = false;
+            heldIdRef.current = null;
+          } else {
+            s.x += (cursor.x - s.x) * FOLLOW_LERP;
+            s.y += (cursor.y - s.y) * FOLLOW_LERP;
+
+            const movedSinceTrail = Math.hypot(s.x - s.lastTrailX, s.y - s.lastTrailY);
+            if (movedSinceTrail >= TRAIL_SPACING) {
+              s.odometer += movedSinceTrail;
+              dropTrailPoint(s, now);
+            }
+
+            if (cursorSpeed < STILL_SPEED) {
+              s.stillMs += 16.6;
+            } else {
+              s.stillMs = 0;
+            }
+
+            if (s.odometer >= DECAY_DISTANCE) {
+              dropTrailPoint(s, now);
+              s.held = false;
+              heldIdRef.current = null;
+              shapesRef.current = shapes.filter((sh) => sh.id !== s.id);
+              pendingSpawnsRef.current.push(now + RESPAWN_MIN_MS + Math.random() * (RESPAWN_MAX_MS - RESPAWN_MIN_MS));
+            } else if (s.stillMs > RELEASE_STILL_MS) {
+              dropTrailPoint(s, now);
+              s.held = false;
+              s.armed = false;
+              heldIdRef.current = null;
+            }
+          }
+        } else {
+          heldIdRef.current = null;
+        }
+      }
+
+      const due = pendingSpawnsRef.current.filter((t) => t <= now);
+      if (due.length > 0) {
+        pendingSpawnsRef.current = pendingSpawnsRef.current.filter((t) => t > now);
+        for (let i = 0; i < due.length; i++) shapesRef.current.push(spawnShape());
+      }
+
+      trailRef.current = trailRef.current.filter((t) => now - t.bornAt < TRAIL_FADE_MS);
+
+    
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      for (const t of trailRef.current) drawTrailPoint(ctx, t, now);
+      for (const s of shapesRef.current) drawShape(ctx, s);
+
+    
+      if (cursor.visible) {
+        ctx.beginPath();
+        ctx.arc(cursor.x, cursor.y, 9, 0, Math.PI * 2);
+        ctx.strokeStyle = ACCENT;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+     
+      const btnX = 40, btnY = 30, btnW = 150, btnH = 45;
+      const hoveringBack = cursor.visible && 
+                           cursor.x >= btnX && cursor.x <= (btnX + btnW) && 
+                           cursor.y >= btnY && cursor.y <= (btnY + btnH);
+
+      if (hoveringBack) {
+        hubChargeRef.current += 0.025;
+        if (hubChargeRef.current >= 1) {
+          window.location.href = 'index.html';
+        }
+      } else {
+        hubChargeRef.current = Math.max(0, hubChargeRef.current - 0.05);
+      }
+
+      ctx.fillStyle = hoveringBack ? 'rgba(255, 122, 26, 0.15)' : 'rgba(255, 255, 255, 0.04)';
+      ctx.strokeStyle = hoveringBack ? 'rgb(255, 122, 26)' : 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(btnX, btnY, btnW, btnH, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      if (hubChargeRef.current > 0) {
+        ctx.fillStyle = 'rgb(255, 122, 26)';
+        ctx.fillRect(btnX, btnY + btnH - 4, btnW * hubChargeRef.current, 4);
+      }
+
+      ctx.textAlign = 'center';
+      ctx.font = '600 13px system-ui, sans-serif';
+      ctx.letterSpacing = '2px';
+      ctx.fillStyle = hoveringBack ? 'rgb(255, 122, 26)' : '#FFFFFF';
+      ctx.fillText('← VOLVER', btnX + (btnW / 2), btnY + 28);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '700 18px system-ui, sans-serif';
+      ctx.letterSpacing = '3px';
+      ctx.fillText('CADUCIDAD', CANVAS_W - 40, 50);
+
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.font = '400 13px system-ui, sans-serif';
+      ctx.letterSpacing = '1px';
+      ctx.fillText('(Como lo perdido en el tránsito)', CANVAS_W - 40, 72);
+
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [ready]);
+
+  return (
+    <div style={{
+      background: BG, minHeight: '100vh', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', padding: 16,
+    }}>
+      <div style={{ position: 'relative', width: '100%', maxWidth: 900 }}>
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_W}
+          height={CANVAS_H}
+          style={{ width: '100%', display: 'block', background: BG, borderRadius: 8, boxShadow: '0 0 20px rgba(0,0,0,0.5)' }}
+        />
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
+        {status.startsWith('Error') && (
+          <p style={{
+            position: 'absolute', bottom: 8, left: 8, margin: 0, color: '#ff6b6b',
+            fontSize: 12, fontFamily: 'system-ui, sans-serif',
+            background: 'rgba(0,0,0,0.65)', padding: '4px 8px', borderRadius: 4,
+          }}>{status}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
